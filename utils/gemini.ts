@@ -1,7 +1,7 @@
 import { ExtractedData, Question, PreExtractionAudit } from "../types";
 
 // ⚠️ మీ API KEY ని ఇక్కడ పేస్ట్ చేయండి
-const API_KEY = "AIzaSyC5nVApYKn32An1ELokNlwVscQnY92VZT0"; 
+const API_KEY = "AIzaSyDLhJLL2JaGR-6bmtU2yHf6ZO8YhSLpeWg"; 
 
 // 1. స్మార్ట్ ఫంక్షన్: బెస్ట్ మోడల్ ని సెలెక్ట్ చేసుకుంటుంది
 async function getBestModel(): Promise<string> {

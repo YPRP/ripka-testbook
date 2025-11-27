@@ -1,146 +1,107 @@
+import { GoogleGenAI } from "@google/genai";
 import { ExtractedData, Question, PreExtractionAudit } from "../types";
 
-// ⚠️ మీ API KEY ని ఇక్కడ పేస్ట్ చేయండి
-const API_KEY = "AIzaSyDLhJLL2JaGR-6bmtU2yHf6ZO8YhSLpeWg"; 
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// 1. స్మార్ట్ ఫంక్షన్: బెస్ట్ మోడల్ ని సెలెక్ట్ చేసుకుంటుంది
-async function getBestModel(): Promise<string> {
-  try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`);
-    const data = await response.json();
-    const models = data.models || [];
+// Helper delay function for backoff
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-    // Flash మోడల్స్ ఫ్రీ టైర్ లో ఎక్కువ కోటా ఇస్తాయి, కాబట్టి వాటికే ప్రాధాన్యత
-    const preferredModels = ["gemini-1.5-flash", "gemini-1.5-flash-001", "gemini-1.5-flash-002", "gemini-pro"];
+/**
+ * Performs a high-level audit of the document to structure the extraction plan.
+ */
+async function getPreExtractionAudit(
+  base64Data: string, 
+  mimeType: string
+): Promise<PreExtractionAudit> {
+  const prompt = `
+    Role: You are an expert AI Document Router for an EdTech application. 
+    Your goal is to analyze the uploaded exam document and determine the most efficient AI model for data extraction.
 
-    for (const pref of preferredModels) {
-      const found = models.find((m: any) => m.name.includes(pref));
-      if (found) return found.name.replace("models/", "");
+    Task: Scan the attached file (do not extract full content yet) and generate a JSON "Audit Report" based on these criteria:
+
+    1. total_questions: Estimate the total number of questions.
+    2. topics_detected: A list of subject names or chapters found.
+
+    3. content_complexity:
+       - If content contains complex tables, heavy formulas, logical puzzles, or diagrams -> "HIGH".
+       - If content is mostly direct text, simple MCQs, or general knowledge -> "LOW".
+
+    4. ocr_quality:
+       - If text is blurry, handwritten, or complex layout -> "POOR".
+       - If text is digital, clear, and selectable -> "CLEAN".
+
+    5. recommended_model (The Routing Logic):
+       - CRITICAL: If complexity is "HIGH" OR quality is "POOR" -> Output "GEMINI_PRO" (Needs high intelligence/vision).
+       - Otherwise -> Output "GEMINI_FLASH" (Speed and efficiency).
+
+    Output Format: JSON
+    {
+      "total_questions": number,
+      "topics_detected": string[],
+      "content_complexity": "HIGH" | "LOW",
+      "ocr_quality": "CLEAN" | "POOR",
+      "recommended_model": "GEMINI_PRO" | "GEMINI_FLASH"
     }
-    return models[0]?.name?.replace("models/", "") || "gemini-1.5-flash";
-  } catch (e) {
-    return "gemini-1.5-flash";
-  }
-}
+  `;
 
-async function callGoogleAPI(prompt: string, base64Data: string, mimeType: string, modelName: string) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${API_KEY}`;
+  // Retry logic for Audit with fallback models
+  // We try models in order of likely availability/stability
+  const modelsToTry = ['gemini-2.5-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-flash'];
   
-  const body = {
-    contents: [{
-      parts: [
-        { inline_data: { mime_type: mimeType, data: base64Data } },
-        { text: prompt }
-      ]
-    }]
-  };
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`API Error: ${response.status}`);
-  }
-
-  const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-}
-
-// --- Main Logic ---
-
-export async function analyzePDF(base64Data: string, mimeType: string, onProgress: (msg: string) => void): Promise<ExtractedData> {
-  try {
-    onProgress("Initializing AI...");
-    const activeModel = await getBestModel();
-    onProgress(`Using Engine: ${activeModel}`);
-    
-    // 1. Audit: మొత్తం ఎన్ని ప్రశ్నలు ఉన్నాయో తెలుసుకోవడం
-    const auditPrompt = 'Analyze this document. Return ONLY valid JSON: { "total_questions": 0, "topics_detected": [], "content_complexity": "LOW", "ocr_quality": "CLEAN" }. Estimate the total_questions count accurately.';
-    
-    const auditRes = await callGoogleAPI(auditPrompt, base64Data, mimeType, activeModel);
-    let auditJson = { total_questions: 50, topics_detected: [], content_complexity: 'LOW', ocr_quality: 'CLEAN' };
-    
+  for (const model of modelsToTry) {
     try {
-      const cleanJson = auditRes.match(/\{[\s\S]*\}/)?.[0];
-      if (cleanJson) auditJson = JSON.parse(cleanJson);
-    } catch(e) { console.log("Audit parse failed, using defaults"); }
-
-    // కనీసం 50 అనుకుందాం, ఒకవేళ AI తప్పు చెప్పినా
-    const totalQ = auditJson.total_questions || 50;
-    onProgress(`Detected approx ${totalQ} questions. Starting extraction...`);
-
-    // 2. Batch Extraction Loop (అన్ని ప్రశ్నలూ రావడానికి)
-    const BATCH_SIZE = 20; // ఒక్కసారికి 20 ప్రశ్నలు
-    const allQuestions: Question[] = [];
-    
-    // లూప్ స్టార్ట్
-    for (let start = 1; start <= totalQ; start += BATCH_SIZE) {
-      const end = Math.min(start + BATCH_SIZE - 1, totalQ);
-      
-      onProgress(`Extracting Questions ${start} to ${end} of ${totalQ}...`);
-      
-      const extractPrompt = `
-        Act as a strict data extractor.
-        Task: Extract questions numbered ${start} to ${end} from the provided document.
-        
-        Return ONLY valid JSON with this structure:
-        {
-          "questions": [
-            {
-              "id": number,
-              "text": "Full question text",
-              "options": ["Option A", "Option B", "Option C", "Option D"],
-              "answer": "Correct Option Text",
-              "explanation": "Detailed explanation if available",
-              "difficulty": "Easy/Medium/Hard",
-              "topic": "Topic Name"
-            }
-          ]
-        }
-      `;
-
-      try {
-        const batchRes = await callGoogleAPI(extractPrompt, base64Data, mimeType, activeModel);
-        const batchJsonStr = batchRes.match(/\{[\s\S]*\}/)?.[0];
-        
-        if (batchJsonStr) {
-          const batchData = JSON.parse(batchJsonStr);
-          if (Array.isArray(batchData.questions)) {
-            allQuestions.push(...batchData.questions);
-          }
-        }
-      } catch (err) {
-        console.warn(`Batch ${start}-${end} failed, skipping...`);
+      return await tryGenerateAudit(model, prompt, base64Data, mimeType);
+    } catch (error: any) {
+      console.warn(`Audit failed with ${model}:`, error);
+      if (model === modelsToTry[modelsToTry.length - 1]) {
+        console.error("All audit models failed, using defaults");
+        return {
+            total_questions: 50, 
+            topics_detected: [],
+            content_complexity: 'HIGH', 
+            ocr_quality: 'POOR',
+            recommended_model: 'GEMINI_FLASH'
+        };
       }
+      await delay(1000); // Wait before trying next model
     }
-    
-    if (allQuestions.length === 0) throw new Error("Extraction failed. Please check if the PDF is clear.");
-
-    // డూప్లికేట్స్ తీసేయడం & సార్టింగ్
-    const uniqueMap = new Map();
-    allQuestions.forEach(q => uniqueMap.set(q.id, q));
-    const finalQuestions = Array.from(uniqueMap.values()).sort((a:any, b:any) => a.id - b.id);
-
-    return {
-      audit: auditJson as any,
-      summary: {
-        totalQuestions: finalQuestions.length,
-        topics: auditJson.topics_detected || [],
-        difficultyDistribution: { Easy: 0, Medium: 0, Hard: 0 }
-      },
-      questions: finalQuestions
-    };
-
-  } catch (error: any) {
-    alert("Error: " + error.message); 
-    throw error;
   }
+  
+  return { total_questions: 50, topics_detected: [], content_complexity: 'HIGH', ocr_quality: 'POOR', recommended_model: 'GEMINI_FLASH' };
 }
 
-// Dummy helpers
-async function getPreExtractionAudit(b: string, m: string) { return {} as any; }
-export async function getStudyHelp(q: string, c: string[]): Promise<string> { return "Chat coming soon."; }
+async function tryGenerateAudit(model: string, prompt: string, base64Data: string, mimeType: string) {
+    const response = await ai.models.generateContent({
+      model: model,
+      contents: {
+        parts: [
+          { inlineData: { mimeType, data: base64Data } },
+          { text: prompt }
+        ]
+      },
+      config: {
+        temperature: 0.1,
+        responseMimeType: "application/json",
+        // Removed maxOutputTokens to prevent 400 errors
+      }
+    });
+
+    const text = response.text || "{}";
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const cleanJson = jsonMatch ? jsonMatch[0] : "{}";
+    return JSON.parse(cleanJson);
+}
+
+/**
+ * Helper function to extract a specific range of questions.
+ * Designed to run in parallel.
+ */
+async function extractBatch(
+  base64Data: string, 
+  mimeType: string, 
+  startQ: number, 
+  endQ: number,
+  modelName: string 
+): Promise<Question[]> {
+  const prompt = `
+    ROLE: Expert Exam parser and Data Aligner.

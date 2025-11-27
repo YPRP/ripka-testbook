@@ -1,12 +1,14 @@
 import { GoogleGenAI } from "@google/genai";
 
-// --- Types (Included here to ensure the file compiles standalone) ---
+// --- Types ---
 export interface Question {
   id: number;
   text: string;
-  options?: string[];
-  answer?: string;
-  explanation?: string;
+  options: string[];
+  answer: string;
+  explanation: string;
+  difficulty: 'Easy' | 'Medium' | 'Hard';
+  topic: string;
 }
 
 export interface PreExtractionAudit {
@@ -18,18 +20,27 @@ export interface PreExtractionAudit {
 }
 
 export interface ExtractedData {
+  audit?: PreExtractionAudit;
+  summary: {
+    totalQuestions: number;
+    topics: string[];
+    difficultyDistribution?: {
+      Easy: number;
+      Medium: number;
+      Hard: number;
+    };
+  };
   questions: Question[];
 }
 
 // --- API Initialization ---
-// Ensure VITE_GEMINI_API_KEY is set in your Netlify Environment Variables
 const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
 
 // Helper delay function for backoff
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Performs a high-level audit of the document to structure the extraction plan.
+ * 1. Performs a high-level audit of the document.
  */
 export async function getPreExtractionAudit(
   base64Data: string,
@@ -66,69 +77,40 @@ export async function getPreExtractionAudit(
     }
   `;
 
-  // Retry logic for Audit with fallback models
-  const modelsToTry = [
-    "gemini-2.0-flash", // Updated to stable version names if available, or keep experimental
-    "gemini-1.5-flash",
-  ];
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.0-flash",
+      contents: {
+        parts: [
+          { inlineData: { mimeType, data: base64Data } },
+          { text: prompt },
+        ],
+      },
+      config: {
+        temperature: 0.1,
+        responseMimeType: "application/json",
+      },
+    });
 
-  for (const model of modelsToTry) {
-    try {
-      return await tryGenerateAudit(model, prompt, base64Data, mimeType);
-    } catch (error: any) {
-      console.warn(`Audit failed with ${model}:`, error);
-      if (model === modelsToTry[modelsToTry.length - 1]) {
-        console.error("All audit models failed, using defaults");
-        return {
-          total_questions: 50,
-          topics_detected: [],
-          content_complexity: "HIGH",
-          ocr_quality: "POOR",
-          recommended_model: "GEMINI_FLASH",
-        };
-      }
-      await delay(1000);
-    }
+    const text = response.text || "{}";
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const cleanJson = jsonMatch ? jsonMatch[0] : "{}";
+    return JSON.parse(cleanJson);
+  } catch (error) {
+    console.error("Audit failed:", error);
+    // Fallback default
+    return {
+      total_questions: 20,
+      topics_detected: ["General"],
+      content_complexity: "HIGH",
+      ocr_quality: "POOR",
+      recommended_model: "GEMINI_FLASH",
+    };
   }
-
-  return {
-    total_questions: 50,
-    topics_detected: [],
-    content_complexity: "HIGH",
-    ocr_quality: "POOR",
-    recommended_model: "GEMINI_FLASH",
-  };
-}
-
-async function tryGenerateAudit(
-  model: string,
-  prompt: string,
-  base64Data: string,
-  mimeType: string
-): Promise<PreExtractionAudit> {
-  const response = await ai.models.generateContent({
-    model: model,
-    contents: {
-      parts: [
-        { inlineData: { mimeType, data: base64Data } },
-        { text: prompt },
-      ],
-    },
-    config: {
-      temperature: 0.1,
-      responseMimeType: "application/json",
-    },
-  });
-
-  const text = response.text || "{}";
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  const cleanJson = jsonMatch ? jsonMatch[0] : "{}";
-  return JSON.parse(cleanJson);
 }
 
 /**
- * Helper function to extract a specific range of questions.
- * Designed to run in parallel.
+ * 2. Helper function to extract a specific range of questions.
  */
 export async function extractBatch(
   base64Data: string,
@@ -137,7 +119,6 @@ export async function extractBatch(
   endQ: number,
   modelName: string
 ): Promise<Question[]> {
-  // FIXED: The string below was unterminated in your original code.
   const prompt = `
     ROLE: Expert Exam parser and Data Aligner.
     
@@ -146,8 +127,10 @@ export async function extractBatch(
     INSTRUCTIONS:
     1. Identify questions clearly marked with numbers between ${startQ} and ${endQ}.
     2. Extract the question text, all options (if MCQ), and the answer (if marked).
-    3. If no answer is marked, leave the answer field empty.
-    4. Format the output strictly as a JSON array of Question objects.
+    3. If no answer is marked, DO NOT HALLUCINATE. Leave it empty.
+    4. Determine the "difficulty" (Easy/Medium/Hard) and "topic" based on the content.
+    5. Generate a short "explanation" for the correct answer.
+    6. Format the output strictly as a JSON array of Question objects.
 
     OUTPUT SCHEMA:
     [
@@ -156,14 +139,19 @@ export async function extractBatch(
         "text": "Question text here",
         "options": ["Option A", "Option B", "Option C", "Option D"],
         "answer": "Correct option text or label",
-        "explanation": "Brief explanation if available"
+        "explanation": "Brief explanation",
+        "difficulty": "Medium",
+        "topic": "Algebra"
       }
     ]
-  `; // <--- This backtick was missing or the string was cut off
+  `;
+
+  // Map internal model names to API model strings if needed
+  const targetModel = modelName === "GEMINI_PRO" ? "gemini-2.0-pro-exp-02-05" : "gemini-2.0-flash";
 
   try {
     const response = await ai.models.generateContent({
-      model: modelName,
+      model: targetModel,
       contents: {
         parts: [
           { inlineData: { mimeType, data: base64Data } },
@@ -177,7 +165,6 @@ export async function extractBatch(
     });
 
     const text = response.text || "[]";
-    // Sanitize and parse
     const jsonMatch = text.match(/\[[\s\S]*\]/); 
     const cleanJson = jsonMatch ? jsonMatch[0] : "[]";
     const data = JSON.parse(cleanJson);
@@ -186,5 +173,109 @@ export async function extractBatch(
   } catch (error) {
     console.error(`Error extracting batch ${startQ}-${endQ}:`, error);
     return [];
+  }
+}
+
+/**
+ * 3. Orchestrator: Analyzes PDF and manages batch extraction.
+ * This was MISSING in your code.
+ */
+export async function analyzePDF(
+  base64Data: string,
+  mimeType: string,
+  onProgress: (msg: string) => void
+): Promise<ExtractedData> {
+  
+  // Step 1: Audit
+  onProgress("Auditing document complexity...");
+  const audit = await getPreExtractionAudit(base64Data, mimeType);
+  
+  console.log("Audit Result:", audit);
+  onProgress(`Detected ${audit.total_questions} questions. Starting extraction...`);
+
+  const totalQuestions = audit.total_questions || 20;
+  const BATCH_SIZE = 10; // Extract 10 questions at a time
+  const allQuestions: Question[] = [];
+
+  // Step 2: Batch Extraction Loop
+  for (let i = 1; i <= totalQuestions; i += BATCH_SIZE) {
+    const start = i;
+    const end = Math.min(i + BATCH_SIZE - 1, totalQuestions);
+    
+    onProgress(`Extracting questions ${start} to ${end}...`);
+    
+    // Add delay to avoid rate limits
+    if (i > 1) await delay(2000);
+
+    const batchQuestions = await extractBatch(
+      base64Data, 
+      mimeType, 
+      start, 
+      end, 
+      audit.recommended_model
+    );
+
+    // Normalize IDs to ensure they are unique and sequential based on our loop
+    const normalizedBatch = batchQuestions.map((q, idx) => ({
+      ...q,
+      id: start + idx // Override ID to ensure sequence
+    }));
+
+    allQuestions.push(...normalizedBatch);
+  }
+
+  onProgress("Finalizing test data...");
+
+  // Step 3: Synthesize Result
+  return {
+    audit,
+    summary: {
+      totalQuestions: allQuestions.length,
+      topics: audit.topics_detected,
+      difficultyDistribution: {
+        Easy: allQuestions.filter(q => q.difficulty === 'Easy').length,
+        Medium: allQuestions.filter(q => q.difficulty === 'Medium').length,
+        Hard: allQuestions.filter(q => q.difficulty === 'Hard').length,
+      }
+    },
+    questions: allQuestions
+  };
+}
+
+/**
+ * 4. AI Study Companion Chat Helper
+ * This was MISSING in your code.
+ */
+export async function getStudyHelp(
+  query: string, 
+  weakTopics: string[]
+): Promise<string> {
+  const context = weakTopics.length > 0 
+    ? `The student is weak in these topics: ${weakTopics.join(', ')}. Try to relate answers to these if relevant.` 
+    : "";
+
+  const prompt = `
+    ROLE: You are a friendly and encouraging AI Tutor for students.
+    CONTEXT: ${context}
+    USER QUERY: ${query}
+    
+    INSTRUCTIONS:
+    - Answer the user's doubt clearly and concisely.
+    - If it's a math problem, solve it step-by-step.
+    - Use bolding for key terms.
+    - Keep the tone supportive.
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.0-flash",
+      contents: {
+        parts: [{ text: prompt }],
+      },
+    });
+    return response.text || "I'm having trouble connecting right now. Please try again.";
+  } catch (error) {
+    console.error("Study Help Error:", error);
+    return "Sorry, I'm currently offline. Please check your internet connection.";
   }
 }

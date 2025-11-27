@@ -1,0 +1,11 @@
+[build]
+  # Typical build command for Vite
+  command = "npm run build"
+  # Typical publish directory for Vite
+  publish = "dist"
+
+# Handle Single Page Application (SPA) routing
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

@@ -1,7 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import { ExtractedData, Question, PreExtractionAudit } from "../types";
 
-const ai = new GoogleGenAI({ API _KEY="AIzaSyBbYLKghcQST5iumJFSUA71P-bk7CyEOkY" });
+const ai = new GoogleGenAI({ API_KEY: import.meta.env.VITE_GEMINI_API_KEY });
 
 // Helper delay function for backoff
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
